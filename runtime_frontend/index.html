@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Исследовательский навигатор · Норникель</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-logo" aria-label="Норникель">
+          <svg viewBox="0 0 370 96" role="img">
+            <path class="logo-mark" d="M48 10a38 38 0 1 0 0 76h1V25l35 50h1a38 38 0 0 0 0-65h-1v50L49 10h-1Zm-9 13v50a26 26 0 0 1 0-50Zm55 50V23a26 26 0 0 1 0 50Z"></path>
+            <text class="logo-word" x="128" y="64">НОРНИКЕЛЬ</text>
+          </svg>
+        </span>
+      </div>
+      <nav class="tabs">
+        <button class="tab is-active" data-view="answer">Ответ</button>
+        <button class="tab" data-view="gaps">Пробелы</button>
+        <button class="tab" data-view="admin">Загрузка</button>
+      </nav>
+    </header>
+
+    <main>
+      <section class="view is-visible" data-panel="answer">
+        <section class="query-band">
+          <div class="hero-copy">
+            <p class="kicker">Норникель AI Hackathon</p>
+            <h1>Исследовательский навигатор</h1>
+          </div>
+          <form id="askForm" class="query-box">
+            <label for="question">Запрос</label>
+            <div class="search-row">
+              <textarea id="question" rows="3" placeholder="Спросите о технологии, материале, процессе, источниках или пробелах в данных"></textarea>
+              <button class="icon-button primary" type="submit" aria-label="Спросить">
+                <svg viewBox="0 0 24 24"><path d="M5 12h13"></path><path d="m13 6 6 6-6 6"></path></svg>
+              </button>
+            </div>
+            <div class="suggestions" aria-label="Подсказки запросов">
+              <button type="button" data-query="Какие технические решения организации циркуляции католита при электроэкстракции никеля описаны в мировой практике?">Циркуляция католита</button>
+              <button type="button" data-query="Какие способы закачки шахтных вод в глубокие горизонты применялись в России и за рубежом?">Шахтные воды</button>
+              <button type="button" data-query="Покажи публикации по распределению Au, Ag и МПГ между медным и никелевым штейном и шлаком.">Au, Ag и МПГ</button>
+              <button type="button" data-query="Где есть пробелы по кучному выщелачиванию в холодном климате?">Пробелы в данных</button>
+            </div>
+            <div class="filters">
+              <label>
+                <span>География</span>
+                <select id="geography">
+                  <option value="world">мировая практика</option>
+                  <option value="ru">Россия</option>
+                  <option value="all">все</option>
+                </select>
+              </label>
+              <label>
+                <span>Период</span>
+                <select id="years">
+                  <option value="5">5 лет</option>
+                  <option value="10">10 лет</option>
+                  <option value="all">все годы</option>
+                </select>
+              </label>
+              <label class="toggle">
+                <input id="verifiedOnly" type="checkbox" checked>
+                <span>подтвержденные</span>
+              </label>
+            </div>
+          </form>
+        </section>
+
+        <section class="summary-grid">
+          <div class="metric-grid">
+            <div class="metric"><span>Источники</span><strong id="metricSources">0</strong></div>
+            <div class="metric"><span>Факты</span><strong id="metricFacts">0</strong></div>
+            <div class="metric"><span>Доверие</span><strong id="metricConfidence">0</strong></div>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><h2>Разбор</h2></div>
+            <div class="chips" id="intentChips"></div>
+          </div>
+
+          <article class="panel answer-panel">
+            <div class="panel-head">
+              <h2>Сводка</h2>
+              <span class="status" id="healthStatus">API</span>
+            </div>
+            <p id="answerText">Задайте вопрос, чтобы получить ответ по графу знаний.</p>
+            <div class="evidence-row" id="evidenceRow"></div>
+          </article>
+        </section>
+
+        <article class="panel graph-panel graph-panel-wide">
+          <div class="panel-head">
+            <h2>Подграф связей</h2>
+            <span class="status muted">источники · сущности · выводы</span>
+          </div>
+          <svg id="knowledgeGraph" class="knowledge-graph" viewBox="0 0 1320 620" role="img"></svg>
+        </article>
+
+        <article class="panel table-panel">
+          <div class="panel-head"><h2>Факты и источники</h2></div>
+          <div class="table-scroll">
+            <table>
+              <thead>
+                <tr><th>Тема</th><th>Условие</th><th>Вывод</th><th>Источник</th><th>Доверие</th></tr>
+              </thead>
+              <tbody id="factsTable"></tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+
+      <section class="view" data-panel="gaps">
+        <section class="panel wide-panel">
+          <div class="panel-head"><h2>Матрица пробелов</h2><span class="status muted">Материал x процесс</span></div>
+          <p id="gapsSummary" class="panel-note">Матрица показывает, какие пары «материал-процесс» уже представлены в корпусе, а где данных мало или нет.</p>
+          <div id="heatmap" class="heatmap"></div>
+        </section>
+      </section>
+
+      <section class="view" data-panel="admin">
+        <section class="panel wide-panel">
+          <div class="panel-head">
+            <h2>Загрузка корпуса</h2>
+            <button id="startIngest" class="text-button" type="button">Загрузить корпус</button>
+          </div>
+          <div class="admin-grid">
+            <label>
+              <span>Папка в контейнере</span>
+              <input id="corpusDir" value="/data/real-corpus">
+            </label>
+            <label>
+              <span>Лимит файлов</span>
+              <div class="stepper">
+                <button id="limitMinus" type="button" aria-label="Уменьшить лимит на 10">−10</button>
+                <input id="ingestLimit" type="number" min="1" max="5000" step="10" value="2000">
+                <button id="limitPlus" type="button" aria-label="Увеличить лимит на 10">+10</button>
+              </div>
+            </label>
+            <div class="load-status">
+              <div class="progress-bar"><span id="loadProgress"></span></div>
+              <p id="adminStatus">Корпус готов к загрузке.</p>
+              <dl>
+                <div><dt>Просмотрено файлов</dt><dd id="statusFiles">0</dd></div>
+                <div><dt>Документов</dt><dd id="statusDocs">0</dd></div>
+                <div><dt>Фактов</dt><dd id="statusExperiments">0</dd></div>
+              </dl>
+            </div>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
