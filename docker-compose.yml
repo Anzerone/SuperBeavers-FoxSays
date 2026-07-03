@@ -1,0 +1,107 @@
+services:
+  neo4j:
+    image: neo4j:5-community
+    container_name: st_neo4j
+    restart: unless-stopped
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      NEO4J_AUTH: neo4j/changeme123
+      NEO4J_PLUGINS: '["apoc", "graph-data-science"]'
+      NEO4J_dbms_security_procedures_unrestricted: 'apoc.*,gds.*'
+      NEO4J_dbms_security_procedures_allowlist: 'apoc.*,gds.*'
+      NEO4J_server_memory_heap_initial__size: 1G
+      NEO4J_server_memory_heap_max__size: 4G
+      NEO4J_server_memory_pagecache_size: 1G
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+      - neo4j_plugins:/plugins
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 40s
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: st_qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' 2>/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+
+  backend:
+    build: ./backend
+    container_name: st_backend
+    restart: unless-stopped
+    ports:
+      - "8010:8000"
+    environment:
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: changeme123
+      QDRANT_URL: http://qdrant:6333
+      OLLAMA_URL: http://host.docker.internal:11434
+      OLLAMA_MODEL_SYNTH: qwen2.5:14b-instruct-q5_K_M
+      OLLAMA_MODEL_TOOL: qwen2.5:3b-instruct-q5_K_M
+      PREMIUM_MODE: "false"
+      EMBEDDINGS_ENABLED: "true"
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-intfloat/multilingual-e5-large}
+      LLM_ENABLED: "true"
+      LLM_PROVIDER: ${LLM_PROVIDER:-ollama}
+      YANDEX_API_KEY: ${YANDEX_API_KEY:-}
+      YANDEX_FOLDER_ID: ${YANDEX_FOLDER_ID:-}
+      YANDEX_MODEL_SYNTH: ${YANDEX_MODEL_SYNTH:-yandexgpt/latest}
+      YANDEX_MODEL_TOOL: ${YANDEX_MODEL_TOOL:-yandexgpt-lite/latest}
+      CORPUS_DIR: /data/corpus
+      UNPACK_ARCHIVES: "true"
+      AUTO_ENRICHMENT_ENABLED: "true"
+      AUTH_DB_PATH: /data/auth/auth.db
+      JWT_SECRET: ${JWT_SECRET:-scientific-tangle-dev-secret-CHANGE-ME}
+      LOG_LEVEL: INFO
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    volumes:
+      - ./backend/app:/app/app
+      # ВАЖНО: НЕ read-only — ингест распаковывает вложенные архивы
+      # (в т.ч. корпусный .zip) в папки *.__unpacked__ рядом с исходниками.
+      - ./data/corpus:/data/corpus
+      - hf_cache:/root/.cache/huggingface
+      - fastembed_cache:/root/.cache/fastembed
+      - auth_data:/data/auth
+
+  frontend:
+    build: ./frontend
+    container_name: st_frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8010
+    depends_on:
+      - backend
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
+  neo4j_plugins:
+  qdrant_data:
+  hf_cache:
+  fastembed_cache:
+  auth_data:
