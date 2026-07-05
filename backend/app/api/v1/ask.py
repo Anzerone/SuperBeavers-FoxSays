@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
@@ -14,7 +15,7 @@ from pydantic import BaseModel, Field
 
 from app.services.graph_matcher import GraphMatcher
 from app.services.graph_service import GraphService
-from app.services.llm_service import LLMService
+from app.services.llm_service import LLMService, user_request_gate
 from app.services.query_parser import QueryParser
 from app.services.rag_service import RAGService
 from app.services.synthesizer import Synthesizer
@@ -44,15 +45,22 @@ def _sse(event, data):
 
 @router.post("")
 async def ask(req: AskRequest):
-    llm = LLMService()
-    rag = RAGService()
-    parser = QueryParser(llm)
-    matcher = GraphMatcher()
-    graph = GraphService()
-    synth = Synthesizer(llm, rag)
+    # Инициализируем сервисы лениво внутри стрима: раньше падение конструктора
+    # (Qdrant не готов, Ollama не поднялся) отдавало 500 до старта SSE — фронт
+    # рисовал «[Ошибка: HTTP 500]» без объяснений. Внутри try/except то же
+    # исключение уйдёт как аккуратный SSE-эвент `error`.
+    llm = None
 
     async def event_stream():
+        nonlocal llm
+        user_request_gate.enter()
         try:
+            llm = LLMService()
+            rag = RAGService()
+            parser = QueryParser(llm)
+            matcher = GraphMatcher()
+            graph = GraphService()
+            synth = Synthesizer(llm, rag)
             cached = answer_cache.get(req.question, req.geo_filter, req.intent_hint)
             if cached:
                 yield _sse("intent", cached.get("intent") or {})
@@ -67,15 +75,20 @@ async def ask(req: AskRequest):
                 await llm.close()
                 return
 
+            t0 = time.perf_counter()
+            timings = {}
             intent = await parser.parse(req.question)
+            timings["parse_intent_ms"] = int((time.perf_counter() - t0) * 1000)
             if req.intent_hint:
                 intent["intent"] = req.intent_hint
             yield _sse("intent", intent)
 
+            t_match = time.perf_counter()
             match_result = matcher.match(
                 intent, geo_filter=req.geo_filter,
                 min_confidence=req.min_confidence,
             )
+            timings["match_ms"] = int((time.perf_counter() - t_match) * 1000)
             experiments = match_result["experiments"]
             match_meta = {
                 "count": len(experiments),
@@ -84,9 +97,18 @@ async def ask(req: AskRequest):
             }
             yield _sse("match", match_meta)
 
-            if req.expand_query and len(experiments) < 3:
+            # Расширение через семантику + FTS: включаем не только при len<3,
+            # но и когда structural-матчер вернул 0 (нет ни одного фильтра
+            # с match'ем). До фикса matcher отдавал 30 случайных экспериментов
+            # → эта ветка не срабатывала → синтезатор получал мусор.
+            needs_expand = (
+                req.expand_query and (len(experiments) < 3 or not match_result.get("experiments"))
+            )
+            if needs_expand:
                 yield _sse("info", {"msg": "мало результатов — расширяем через семантику"})
+                t_sem = time.perf_counter()
                 sem = rag.search_similar_experiments(req.question, top_k=15)
+                timings["semantic_expand_ms"] = int((time.perf_counter() - t_sem) * 1000)
                 exp_ids = {e["experiment_id"] for e in experiments}
                 for r in sem:
                     if r["experiment_id"] not in exp_ids:
@@ -100,7 +122,9 @@ async def ask(req: AskRequest):
 
                 # FTS-сидинг (лексический recall по кодам/точным терминам)
                 if settings.fts_seed_enabled:
+                    t_fts = time.perf_counter()
                     seed = fulltext_seed(req.question)
+                    timings["fts_seed_ms"] = int((time.perf_counter() - t_fts) * 1000)
                     for eid in seed["experiments"]:
                         if eid and eid not in exp_ids:
                             experiments.append({
@@ -121,12 +145,16 @@ async def ask(req: AskRequest):
                             have_docs.add(did)
 
             exp_ids = [e["experiment_id"] for e in experiments if e.get("experiment_id")]
+            t_sub = time.perf_counter()
             sub = graph.fetch_for_experiments(exp_ids) if exp_ids else {"nodes": [], "edges": []}
+            timings["subgraph_ms"] = int((time.perf_counter() - t_sub) * 1000)
             yield _sse("subgraph", sub)
 
+            t_synth = time.perf_counter()
             chunks_used, token_stream = await synth.synthesize_stream(
                 req.question, intent, experiments,
             )
+            timings["synth_setup_ms"] = int((time.perf_counter() - t_synth) * 1000)
             # Верификация источников (Gap #6): обогащаем чанки метаданными документа
             try:
                 metas = graph.fetch_document_meta([c.get("doc_id") for c in chunks_used])
@@ -141,9 +169,18 @@ async def ask(req: AskRequest):
             yield _sse("sources", chunks_used)
 
             full_answer_parts = []
+            t_stream_start = time.perf_counter()
+            first_token_ms = None
             async for tok in token_stream():
+                if first_token_ms is None:
+                    first_token_ms = int((time.perf_counter() - t_stream_start) * 1000)
                 full_answer_parts.append(tok)
                 yield _sse("token", {"text": tok})
+            timings["stream_total_ms"] = int((time.perf_counter() - t_stream_start) * 1000)
+            timings["first_token_ms"] = first_token_ms or 0
+            timings["total_ms"] = int((time.perf_counter() - t0) * 1000)
+            logger.info(f"/ask timings: {timings} q='{req.question[:60]}'")
+            yield _sse("timings", timings)
 
             full_answer = "".join(full_answer_parts)
 
@@ -168,7 +205,12 @@ async def ask(req: AskRequest):
             logger.exception("ask failed")
             yield _sse("error", {"message": str(e)})
         finally:
-            await llm.close()
+            user_request_gate.exit()
+            if llm is not None:
+                try:
+                    await llm.close()
+                except Exception:  # noqa: BLE001
+                    pass
 
     return StreamingResponse(
         event_stream(), media_type="text/event-stream",

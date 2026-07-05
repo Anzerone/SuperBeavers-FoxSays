@@ -16,8 +16,13 @@ class Settings(BaseSettings):
     qdrant_collection_experiments: str = "experiments_desc"
     qdrant_collection_chunks: str = "document_chunks"
     embeddings_enabled: bool = True
+    # Провайдер эмбеддингов: 'yandex' (облако, дефолт) или 'local' (fastembed).
+    # Yandex Foundation Models: text-search-doc + text-search-query, 256 dim.
+    embedding_provider: str = "yandex"
     embedding_model: str = "intfloat/multilingual-e5-large"
-    embedding_dim: int = 1024
+    embedding_dim: int = 256
+    yandex_embedding_model_doc: str = "text-search-doc/latest"
+    yandex_embedding_model_query: str = "text-search-query/latest"
     similarity_threshold: float = 0.72
 
     # Ollama — сдвоенная стратегия моделей
@@ -75,6 +80,29 @@ class Settings(BaseSettings):
     extract_max_docs: int = 200
     extract_max_chunks_per_doc: int = 30
     extract_min_confidence: float = 0.55
+    useful_info_import_enabled: bool = True
+    useful_info_report_path: str = "/outputs/useful_info/useful_info_by_file.jsonl"
+    useful_info_enrich_max_tokens: int = 300
+    # После IngestService.load_corpus автоматически запускать обогащение
+    # useful_info-сниппетов через LLM. Кнопки «Загрузить корпус» и
+    # «Обогатить» на UI используют этот же путь.
+    useful_info_enrich_on_ingest: bool = True
+    # CSV с экспериментами больше не считаем источником истины — их место
+    # заняли useful_info-драфты + LLM-экстракция из чанков.
+    load_csv_experiments: bool = False
+    # Демо-справочник (MAT-001..004, MODE-001..004, PROP-001..004, EQ-001..003,
+    # TAG-mech и т.п.) — плейсхолдеры «Материал A1», «Раствор Р1». Настоящие
+    # материалы и режимы регистрируются провизорными кодами из LLM-экстракции.
+    load_demo_dicts: bool = False
+    load_demo_teams: bool = False
+    # Модели для двух путей структурной экстракции. Разделены, чтобы можно
+    # было запустить фазу 2 (тяжёлые PDF-документы) и обогащение useful_info
+    # (короткие сниппеты) параллельно на РАЗНЫХ Ollama-очередях:
+    #   - extract  → qwen2.5:3b (быстро прогнать 1600+ документов)
+    #   - enrich   → qwen2.5:14b (лучше выделяет материалы/режимы на сниппетах)
+    # Обе пустые = fallback на tool-модель (3B). Меняются через env.
+    ollama_model_extract: str = ""
+    ollama_model_enrich: str = ""
 
     # CAG-кэш (janson-заимствование): дедуп чанков + кэш ответов Q&A
     chunk_dedup: bool = True
@@ -99,6 +127,15 @@ class Settings(BaseSettings):
     auto_enrichment_enabled: bool = True
     auto_enrichment_batch_interval_s: int = 300  # раз в 5 минут — тяжёлые шаги
     contradiction_confidence_threshold: float = 0.75
+
+    # Автоингест при старте: если Neo4j пустой (нет ни одного Document/Experiment),
+    # запустим IngestService().load_corpus() в фоновом потоке. Это даёт «датасет из
+    # коробки»: развернул compose — и всё уже в БД. Флаг можно выключить через env.
+    auto_ingest_on_startup: bool = True
+
+    # Параллельный парсинг документов: 0 = последовательно (старое поведение),
+    # >=2 = ProcessPoolExecutor с N воркерами. На 8-ядерном CPU оптимум ~6-7.
+    ingest_workers: int = 6
 
     # Температурные бакеты для матрицы пробелов (без металлургической специфики)
     temp_buckets: list[int] = [0, 200, 400, 600, 800, 1000, 1200, 1500]

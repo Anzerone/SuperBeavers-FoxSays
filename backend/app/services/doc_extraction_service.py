@@ -40,6 +40,74 @@ def _prov_code(prefix, text):
     return f"{prefix}-EXT-{h}"
 
 
+# Признаки того, что сниппет — оглавление курса / список модулей, а не эксперимент.
+# Достаточно двух совпадений, чтобы дропнуть без LLM-звонка.
+_TOC_MARKERS = (
+    "модул", "раздел", "глав", "оглавлен", "содержани курса",
+    "о курсе", "введение видеолек", "видеолекция", "тестировани",
+    "презентац", "слайд", "лекц", "план курса", "структура курс",
+    "литератур", "контрольн", "домашн", "самопровер",
+    "компонент модул", "элемент модул",
+)
+
+# Экспериментальный «якорь»: слова из химтех/металлургии, реально описывающие
+# процесс или измерение. Хотя бы одно должно быть, иначе — не эксперимент.
+_EXP_MARKERS = (
+    "температур", "давлен", "концентрац", "выщелачив", "плавк", "содержан",
+    "извлечен", "прочност", "растворен", "окислен", "восстановлен",
+    "фильтрац", "флотац", "электролиз", "коррозион", "твёрдост", "твердост",
+    "вязкост", "плотност", "проводим", "pH", "мг/л", "МПа", "об.%", "мас.%",
+    "мкм", "ppm", "°c", "°с",
+)
+
+# Регулярка «число + единица» — самый надёжный маркер измерения.
+_NUM_UNIT_RE = re.compile(
+    r"\b\d+(?:[.,]\d+)?\s*"
+    r"(?:%|°[cCсС]|мг/л|г/л|мкм|нм|мм|см|м|мл|л|МПа|МПа|мбар|кПа|Па|"
+    r"ppm|мас\.?%|об\.?%|А/м²|А/м2|мкА|кА|мВт|Вт|кВт|Дж|кДж|мВ|В|кВ|Ом|"
+    r"кг|т|тонн|ч|мин|сут)",
+    re.IGNORECASE,
+)
+
+
+def _looks_experimental(text):
+    """Быстрый эвристический фильтр «это описание эксперимента, а не TOC»."""
+    if not text or len(text) < 40:
+        return False
+    low = text.lower()
+    toc_hits = sum(1 for m in _TOC_MARKERS if m in low)
+    if toc_hits >= 2:
+        return False
+    exp_hits = sum(1 for m in _EXP_MARKERS if m.lower() in low)
+    has_num_unit = bool(_NUM_UNIT_RE.search(text))
+    return has_num_unit or exp_hits >= 1
+
+
+def _first_dict_hit(index_dict, entities, text):
+    """Ищет самое длинное совпадение любого ключа словаря в тексте.
+    Возвращает display_name entity (для последующего resolve_or_register)
+    или None. Работает как поверхностный NER — не идеально, но быстро
+    и без второго LLM-вызова."""
+    if not text or not index_dict:
+        return None
+    from app.services.dictionary import _norm as _dict_norm
+    low = _dict_norm(text)
+    if not low:
+        return None
+    best_len = 0
+    best_code = None
+    for key, code in index_dict.items():
+        if not key or len(key) < 3:
+            continue
+        if key in low and len(key) > best_len:
+            best_len = len(key)
+            best_code = code
+    if not best_code:
+        return None
+    ent = entities.get(best_code) or {}
+    return ent.get("display_name") or best_code
+
+
 class DocExtractionService:
     def __init__(self, llm: LLMService, rag: RAGService, ner: NERService):
         self.llm = llm
@@ -58,18 +126,25 @@ class DocExtractionService:
     # Публичный вход
     # ------------------------------------------------------------------
 
-    async def extract_all(self, limit=None, scope="all"):
+    async def extract_all(self, limit=None, scope="all", should_cancel=None):
         limit = limit or settings.extract_max_docs
         docs = self._list_documents(limit=limit, scope=scope)
+        cancelled = False
         for doc in docs:
+            if should_cancel and should_cancel():
+                cancelled = True
+                self._emit("cancelled", {"processed": self.stats["documents"]})
+                logger.info(f"Doc extraction cancelled after {self.stats['documents']} docs")
+                break
             try:
                 await self.extract_document(doc["doc_id"])
                 self.stats["documents"] += 1
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"extract failed for {doc['doc_id']}: {e}")
                 self._emit("extract_error", {"doc_id": doc["doc_id"], "error": str(e)[:200]})
-        logger.info(f"Doc extraction done: {self.stats}")
-        return {"stats": self.stats, "events": self.events}
+        if not cancelled:
+            logger.info(f"Doc extraction done: {self.stats}")
+        return {"stats": self.stats, "events": self.events, "cancelled": cancelled}
 
     async def extract_document(self, doc_id):
         chunks = self._doc_chunks(doc_id, limit=settings.extract_max_chunks_per_doc)
@@ -147,9 +222,12 @@ class DocExtractionService:
         prompt = ee_prompts.build_prompt(chunk["text"], known_materials=mats,
                                          known_properties=props)
         try:
+            # Экстракция идёт на tool-модели (qwen2.5:3b) — она мельче, не выселяет
+            # 14b synth из VRAM и не блокирует Q&A. Задача структурная (материал/
+            # режим/свойство/значение), 3b с ней справляется.
             result = await self.llm.generate_json(
                 prompt, system=ee_prompts.SYSTEM,
-                model=settings.ollama_model_synth, max_tokens=600,
+                model=(settings.ollama_model_extract or None), max_tokens=600,
             )
         except Exception as e:  # noqa: BLE001
             logger.debug(f"LLM extract unavailable: {e}")
@@ -165,6 +243,208 @@ class DocExtractionService:
                 self._emit("review_pending", {"doc_id": doc_id, "record": rec, "confidence": conf})
                 continue
             self._upsert_extracted_experiment(doc_id, chunk, rec, conf)
+
+    # ------------------------------------------------------------------
+    # Обогащение useful_info экспериментов (Шаг 2)
+    # ------------------------------------------------------------------
+
+    async def enrich_useful_info_experiments(self, limit=None, should_cancel=None):
+        """Прогоняет черновые useful_info-эксперименты через OLLAMA_MODEL_ENRICH и
+        достраивает USED_MATERIAL / USED_MODE / MEASURED / RESULTED_IN.
+
+        Черновые записи создаёт IngestService._import_useful_info: у них
+        source='useful_info', description = сниппет, но нет связей с
+        материалом/режимом/свойством. LLM превращает сниппет в структуру.
+        """
+        rows = self._list_useful_info_experiments(limit)
+        if not rows:
+            logger.info("useful_info enrich: nothing to do")
+            return {"stats": self.stats, "events": self.events}
+
+        logger.info(f"useful_info enrich: {len(rows)} experiments queued")
+        import asyncio
+        from app.services.llm_service import user_request_gate
+        cancelled = False
+        processed = 0
+        for row in rows:
+            if should_cancel and should_cancel():
+                cancelled = True
+                self._emit("cancelled", {"processed": processed})
+                logger.info(f"useful_info enrich cancelled after {processed} rows")
+                break
+            # Пауза между итерациями + уступка user-запросам: если UI сейчас
+            # ждёт ответ от /ask или /gaps/hypothesis, enrichment замирает.
+            # Иначе enrich-модель + интерактивная synth-модель на одном GPU
+            # конкурируют и гипотеза не приходит по 2 минуты.
+            await user_request_gate.wait_until_free()
+            try:
+                await self._enrich_one_useful_info(row)
+                processed += 1
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"enrich failed for {row['exp_id']}: {e}")
+                self._emit("enrich_error", {"exp_id": row["exp_id"], "error": str(e)[:200]})
+            await asyncio.sleep(0.1)
+        if not cancelled:
+            logger.info(f"useful_info enrich done: {self.stats}")
+        return {"stats": self.stats, "events": self.events, "cancelled": cancelled}
+
+    def _list_useful_info_experiments(self, limit):
+        neo = get_neo4j()
+        # Берём только те, где ещё нет структурных связей — чтобы не пересчитывать
+        # то же самое при повторном вызове. Description < 60 симв. — не тратим
+        # LLM на такие короткие фрагменты, там нечего структурировать.
+        # Плюс серверный prefilter: отсекаем сниппеты без чисел и без ключевых
+        # экспериментальных слов — это оглавления учебных курсов, LLM возвращает
+        # на них {"experiments": []} после ~7 секунд, а их 90%+ в корпусе.
+        q = """
+        MATCH (e:Experiment)
+        WHERE e.source = 'useful_info'
+          AND size(coalesce(e.description, '')) >= 60
+          AND NOT (e)-[:USED_MATERIAL]->()
+          AND NOT (e)-[:USED_MODE]->()
+          AND NOT (e)-[:MEASURED]->()
+        OPTIONAL MATCH (e)-[:DOCUMENTED_IN]->(d:Document)
+        RETURN e.experiment_id AS exp_id,
+               e.description   AS description,
+               e.title         AS title,
+               d.doc_id        AS doc_id
+        LIMIT $lim
+        """
+        # По дефолту — без потолка (25k, что заведомо больше корпуса). Ручной
+        # limit можно передать через POST /useful_info/enrich body.
+        lim = int(limit) if limit else 25000
+        with neo.driver.session() as s:
+            recs = s.run(q, lim=lim)
+            rows = [dict(r) for r in recs]
+
+        # Prefilter garbage перед тем как отправить на LLM. Раньше 95% времени
+        # съедали снипеты вида «5] 5 Компоненты модуля | 5 блоков 12 модулей…»
+        # (оглавления курса) — они дают {"experiments": []} после ~7 сек LLM.
+        kept, dropped = [], 0
+        for r in rows:
+            if _looks_experimental(r.get("description") or ""):
+                kept.append(r)
+            else:
+                dropped += 1
+        if dropped:
+            logger.info(f"useful_info prefilter: kept {len(kept)}, dropped {dropped} as non-experimental")
+        return kept
+
+    async def _enrich_one_useful_info(self, row):
+        text = (row.get("description") or "").strip()
+        if len(text) < 40:
+            return
+
+        # Pattern-matching до LLM: если в сниппете явно есть ≥2 из
+        # {material, mode, property} по словарю — минуем LLM (~30 сек экономии).
+        prefilter = dictionary.pattern_prefilter(text)
+        if prefilter:
+            self._apply_structure_to_experiment(row, prefilter, float(prefilter["confidence"]))
+            self._emit("useful_info_prefilter", {
+                "exp_id": row["exp_id"],
+                "confidence": prefilter["confidence"],
+            })
+            return
+
+        mats = [m["code"] for m in dictionary.all_materials()[:40]]
+        props = [p["code"] for p in dictionary.all_properties()[:30]]
+        prompt = ee_prompts.build_prompt(text, known_materials=mats, known_properties=props)
+        try:
+            result = await self.llm.generate_json(
+                prompt, system=ee_prompts.SYSTEM,
+                model=(settings.ollama_model_enrich or settings.ollama_model_extract or None),
+                max_tokens=settings.useful_info_enrich_max_tokens,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"LLM enrich unavailable: {e}")
+            self.stats["skipped_llm"] += 1
+            return
+        if not result:
+            return
+
+        applied = 0
+        for rec in (result.get("experiments") or []):
+            conf = float(rec.get("confidence") or 0.0)
+            if conf < settings.extract_min_confidence:
+                self.stats["review_pending"] += 1
+                self._emit("review_pending", {
+                    "exp_id": row["exp_id"], "record": rec, "confidence": conf,
+                })
+                continue
+            self._apply_structure_to_experiment(row, rec, conf)
+            applied += 1
+        if applied:
+            self._emit("useful_info_enriched", {
+                "exp_id": row["exp_id"], "records_applied": applied,
+            })
+
+    def _apply_structure_to_experiment(self, row, rec, conf):
+        """Достраивает связи существующему Experiment (не создаёт новый)."""
+        exp_id = row["exp_id"]
+        doc_id = row.get("doc_id")
+        material = (rec.get("material") or "").strip()
+        mode = (rec.get("mode") or "").strip()
+        prop = (rec.get("property") or "").strip()
+        conclusion = (rec.get("conclusion") or "").strip()
+        if not (material or mode or prop or conclusion):
+            return
+
+        # Fallback на словарный NER, если LLM не вернул material/mode/property.
+        # На корпусе Норникеля LLM оставлял material="" в 84% случаев — сниппет
+        # описывает измерение, но конкретный материал только подразумевается
+        # (из контекста документа). Дешевле пробежаться по description +
+        # title + doc-title регуляркой словаря, чем гонять ещё один LLM-вызов.
+        haystack = " ".join([
+            (row.get("description") or ""),
+            (row.get("title") or ""),
+        ])
+        if not material:
+            hit = _first_dict_hit(dictionary._material_index,
+                                  dictionary._materials, haystack)
+            if hit:
+                material = hit
+        if not mode:
+            hit = _first_dict_hit(dictionary._mode_index,
+                                  dictionary._modes, haystack)
+            if hit:
+                mode = hit
+        if not prop:
+            hit = _first_dict_hit(dictionary._property_index,
+                                  dictionary._properties, haystack)
+            if hit:
+                prop = hit
+
+        mat_code = self._resolve_or_register(material, "material") if material else None
+        prop_code = self._resolve_or_register(prop, "property") if prop else None
+        mode_code = self._resolve_or_register(mode, "mode") if mode else None
+
+        value = rec.get("value")
+        try:
+            value = float(value) if value is not None else None
+        except (TypeError, ValueError):
+            value = None
+        unit = rec.get("unit")
+        parsed_mode = struct_loader.parse_mode_string(mode) if mode else None
+
+        neo = get_neo4j()
+        with neo.driver.session() as s:
+            # обновляем confidence, если LLM оценил выше
+            s.execute_write(_tx_bump_confidence, exp_id, conf)
+            if mat_code:
+                s.execute_write(_tx_used, exp_id, "Material", mat_code, "USED_MATERIAL")
+            if mode_code:
+                s.execute_write(_tx_used, exp_id, "Mode", mode_code, "USED_MODE")
+                self._attach_mode_params(s, mode_code, parsed_mode)
+            if prop_code:
+                s.execute_write(_tx_measured, exp_id, prop_code, value, unit)
+            if conclusion:
+                conc_id = "CONC-EXT-" + hashlib.sha1(
+                    (exp_id + conclusion).encode("utf-8")).hexdigest()[:12].upper()
+                s.execute_write(_tx_conclusion, conc_id, conclusion, conf, doc_id or "")
+                s.execute_write(_tx_resulted_in, exp_id, conc_id)
+                self.stats["conclusions"] += 1
+
+        self.stats["experiments"] += 1
 
     def _upsert_extracted_experiment(self, doc_id, chunk, rec, conf):
         material = (rec.get("material") or "").strip()
@@ -229,15 +509,40 @@ class DocExtractionService:
                 session.execute_write(_tx_mode_param, mode_code, pname, float(parsed[name]), unit)
 
     def _resolve_or_register(self, text, kind):
-        """Возвращает код известной сущности или регистрирует провизорную."""
+        """Возвращает код известной сущности + гарантирует, что узел в графе
+        существует и имеет display_name/description из словаря.
+
+        Раньше при попадании в словарь (например LLM вернул «медный концентрат»
+        → нашли MAT-CU-CONC) функция ретёрнилась сразу, не создавая узел.
+        А `_tx_used` использует MATCH — если узла нет, ребро молча не создаётся.
+        Итог: канонические материалы существовали только в памяти словаря,
+        в Neo4j оставались лишь провизорные MAT-EXT-*.
+        """
         lookup = {
             "material": dictionary.lookup_material,
             "property": dictionary.lookup_property,
             "mode": dictionary.lookup_mode,
         }[kind]
+        get_entity = {
+            "material": dictionary.get_material,
+            "property": dictionary.get_property,
+            "mode": dictionary.get_mode,
+        }[kind]
+        neo = get_neo4j()
+        label = {"material": "Material", "property": "Property", "mode": "Mode"}[kind]
+
         code = lookup(text)
         if code:
+            # Каноничный код — берём display_name и description из словаря
+            ent = get_entity(code) or {}
+            meta = ent.get("meta") or {}
+            with neo.driver.session() as s:
+                s.execute_write(_tx_upsert_dict_node, label, code,
+                                ent.get("display_name") or text,
+                                meta.get("description"))
             return code
+
+        # Провизорный: LLM нашёл что-то, чего нет в словаре
         if kind == "material":
             code = _prov_code("MAT", text)
             dictionary.register_material(code, text, meta={"provenance": "extracted"})
@@ -247,9 +552,6 @@ class DocExtractionService:
         else:
             code = _prov_code("MODE", text)
             dictionary.register_mode(code, text, meta={"provenance": "extracted"})
-        # создаём узел справочника в графе
-        neo = get_neo4j()
-        label = {"material": "Material", "property": "Property", "mode": "Mode"}[kind]
         with neo.driver.session() as s:
             s.execute_write(_tx_provisional_node, label, code, text)
         return code
@@ -316,6 +618,32 @@ def _tx_provisional_node(tx, label, code, name):
         f"""MERGE (x:{label} {{code: $code}})
             ON CREATE SET x.display_name = $name, x.provenance = 'extracted'""",
         code=code, name=name[:200],
+    )
+
+
+def _tx_upsert_dict_node(tx, label, code, display_name, description):
+    """Гарантирует узел канонической сущности со словарным display_name и
+    полным description (если задан в CSV). На SET — не затираем description,
+    если он уже прописан вручную, но обновляем display_name из словаря."""
+    tx.run(
+        f"""MERGE (x:{label} {{code: $code}})
+            SET x.display_name = $name,
+                x.provenance = coalesce(x.provenance, 'dictionary'),
+                x.description = coalesce(x.description, $descr)""",
+        code=code,
+        name=(display_name or code)[:200],
+        descr=(description or None) and str(description)[:2000],
+    )
+
+
+def _tx_bump_confidence(tx, exp_id, new_conf):
+    tx.run(
+        """MATCH (e:Experiment {experiment_id: $eid})
+           SET e.confidence = CASE
+                WHEN e.confidence IS NULL OR $c > e.confidence THEN $c
+                ELSE e.confidence END,
+               e.enriched_at = datetime()""",
+        eid=exp_id, c=float(new_conf),
     )
 
 

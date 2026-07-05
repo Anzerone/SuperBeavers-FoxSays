@@ -74,10 +74,24 @@ export default function NodeDetailsPanel({ node, onClose }) {
       <div className="flex-1 overflow-y-auto p-4">
         <h2 className="mb-3 text-lg font-semibold leading-snug">{node.title}</h2>
 
+        {node.description && (
+          <section className="mb-4 rounded-lg border border-text-muted/15 bg-text-muted/5 p-3">
+            <div className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-text-muted">
+              Описание
+            </div>
+            <p className="whitespace-pre-wrap text-sm leading-relaxed text-text">
+              {node.description}
+            </p>
+          </section>
+        )}
+
         <dl className="space-y-2 text-sm">
           {node.year && <Row k="Год" v={node.year} />}
           {node.journal && <Row k="Издание" v={node.journal} />}
           {node.doc_type && <Row k="Тип источника" v={DOC_TYPE_LABELS[node.doc_type] || node.doc_type} />}
+          {node.family && <Row k="Семейство" v={node.family} />}
+          {node.base_element && <Row k="Базовый элемент" v={node.base_element} />}
+          {node.gost && <Row k="ГОСТ" v={node.gost} />}
           {node.category && <Row k="Категория" v={node.category} />}
           {node.unit && <Row k="Ед. изм." v={node.unit} />}
           {node.temperature_c != null && <Row k="Температура" v={`${node.temperature_c} °C`} />}
@@ -154,20 +168,23 @@ export default function NodeDetailsPanel({ node, onClose }) {
         )}
       </div>
 
-      {(node.source_doc_id || node.file_path) && (
-        <footer className="border-t border-text-muted/10 p-4">
-          <div className="mb-2 flex items-center gap-1.5 text-xs text-text-muted">
+      {(node.source_doc_id || node.doc_id || node.file_path) && (
+        <footer className="border-t border-text-muted/10 p-4 space-y-2">
+          <div className="mb-1 flex items-center gap-1.5 text-xs text-text-muted">
             <FileText size={13} /> Источник
           </div>
-          {node.source_doc_id ? (
-            <a href={`/explorer/document/${encodeURIComponent(node.source_doc_id)}`}
+          {(node.source_doc_id || (node.type === 'document' && node.id)) && (
+            <a href={`/explorer/document/${encodeURIComponent(node.source_doc_id || node.id)}`}
                className="btn-secondary w-full justify-center">
-              <ExternalLink size={16} /> Открыть документ-источник
+              <ExternalLink size={14} /> Открыть в эксплорере
             </a>
-          ) : (
-            <p className="break-all font-mono text-[11px] text-text-muted" title={node.file_path}>
-              {node.file_path}
-            </p>
+          )}
+          {(node.source_doc_id || (node.type === 'document' && node.id)) && (
+            <a href={`/api/v1/explorer/document/${encodeURIComponent(node.source_doc_id || node.id)}/file`}
+               target="_blank" rel="noreferrer"
+               className="btn-primary w-full justify-center">
+              <ExternalLink size={14} /> Открыть файл документа
+            </a>
           )}
         </footer>
       )}

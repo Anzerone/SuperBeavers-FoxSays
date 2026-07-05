@@ -345,3 +345,81 @@ def iter_documents(corpus_dir, root=None):
             yield load_document(f, root=walk_root)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"failed to load {f}: {e}")
+
+
+# --- Top-level worker: должен быть picklable, поэтому вынесен из класса. ---
+def _parse_worker(args):
+    path_str, root_str = args
+    try:
+        return load_document(Path(path_str), root=Path(root_str) if root_str else None)
+    except Exception as e:  # noqa: BLE001
+        return {"__error__": f"{type(e).__name__}: {e}", "__path__": path_str}
+
+
+def iter_documents_parallel(corpus_dir, root=None, max_workers=None, skip_paths=None):
+    """Параллельный обход: N процессов парсят PDF/DOCX/…, main получает
+    словари документов через as_completed по мере готовности. Порядок
+    не гарантируется, но нам всё равно — эмбеддинг и upsert идемпотентны.
+
+    skip_paths — множество file_path, которые не нужно переспарсить
+    (например, уже есть в Neo4j). Даёт resume после краша.
+    """
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    import os as _os
+
+    corpus = Path(corpus_dir)
+    walk_root = Path(root) if root else corpus
+    legacy = corpus / "documents"
+    if legacy.exists() and not settings.corpus_recursive:
+        walk_root = legacy
+
+    all_paths = [str(f) for f in iter_document_paths(walk_root)]
+    if not all_paths:
+        return
+    if skip_paths:
+        before = len(all_paths)
+        paths = [p for p in all_paths if p not in skip_paths]
+        logger.info(f"Skip {before - len(paths)} already-ingested docs "
+                    f"({len(paths)} to process)")
+    else:
+        paths = all_paths
+    if not paths:
+        return
+
+    if max_workers is None:
+        cpu = _os.cpu_count() or 4
+        max_workers = max(2, min(8, cpu - 1))
+    root_str = str(walk_root)
+
+    # Крупные PDF (>40 MB) грузим меньшим числом воркеров — pdfplumber
+    # держит ~1.5 GB на 100 MB PDF, 6 параллельных → OOM в контейнере.
+    LARGE_BYTES = 40 * 1024 * 1024
+    small_paths, large_paths = [], []
+    for p in paths:
+        try:
+            (large_paths if _os.path.getsize(p) > LARGE_BYTES else small_paths).append(p)
+        except OSError:
+            small_paths.append(p)
+    large_workers = max(2, max_workers // 2)
+
+    def _run_pool(batch, workers, label):
+        if not batch:
+            return
+        logger.info(f"Parsing {len(batch)} {label} docs with {workers} workers")
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_parse_worker, (p, root_str)) for p in batch]
+            for fut in as_completed(futures):
+                try:
+                    doc = fut.result()
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"worker crashed: {e}")
+                    continue
+                if not doc:
+                    continue
+                if "__error__" in doc:
+                    logger.warning(f"failed to load {doc.get('__path__')}: {doc['__error__']}")
+                    continue
+                yield doc
+
+    yield from _run_pool(small_paths, max_workers, "small")
+    yield from _run_pool(large_paths, large_workers, "large")

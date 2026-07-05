@@ -19,41 +19,81 @@ from app.db.neo4j_client import get_neo4j
 from app.loaders import archives as arc_loader
 from app.loaders import documents as doc_loader
 from app.loaders import structured as struct_loader
+from app.loaders import useful_info as useful_info_loader
 from app.loaders import web as web_loader
 from app.services import dictionary, geo
 
 
 class IngestService:
 
-    def load_corpus(self, corpus_dir):
+    def load_corpus(self, corpus_dir, structured_dir=None):
+        """Загружает корпус.
+
+        corpus_dir     — где лежат документы (PDF/DOCX/…): рекурсивный обход.
+        structured_dir — где лежат dicts/*.csv, experiments.csv, staff.csv,
+                         teams.csv. Если None — сначала пробуем corpus_dir,
+                         затем fallback на /data/corpus (общий корень).
+        """
         stats = {
             "experiments": 0, "documents": 0, "web_resources": 0,
-            "chunks": 0, "chunks_deduped": 0, "archives": 0, "by_type": {}, "errors": [],
+            "chunks": 0, "chunks_deduped": 0, "archives": 0, "by_type": {},
+            "useful_info": {"documents": 0, "authors": 0, "experiments": 0},
+            "errors": [],
         }
         self._seen_chunk_hashes = set()
         self._chunks_deduped = 0
 
-        # --- Структурированные данные (опциональны для реального корпуса) ---
+        # --- Структурированные данные (dicts + CSV с экспериментами) ---
+        # Ищем в: явно переданном пути → CORPUS_DIR → /data/corpus.
+        import os
         import pandas as pd
+
+        candidates = []
+        if structured_dir:
+            candidates.append(structured_dir)
+        candidates.extend([corpus_dir, "/data/corpus"])
+
+        def _looks_structured(p):
+            if not p or not os.path.isdir(p):
+                return False
+            return (os.path.isdir(os.path.join(p, "dicts"))
+                    or os.path.isfile(os.path.join(p, "experiments.csv"))
+                    or os.path.isfile(os.path.join(p, "experiments.xlsx"))
+                    or os.path.isfile(os.path.join(p, "staff.csv"))
+                    or os.path.isfile(os.path.join(p, "teams.csv")))
+
+        struct_root = next((p for p in candidates if _looks_structured(p)), corpus_dir)
+        logger.info(f"Structured data root: {struct_root}")
         try:
-            data = struct_loader.load_corpus(corpus_dir)
+            data = struct_loader.load_corpus(struct_root)
         except Exception as e:
-            # реальный корпус может не содержать experiments.csv / dicts —
-            # это не повод падать: продолжаем с документами.
             stats["errors"].append(f"structured skipped: {e}")
             data = {"experiments": pd.DataFrame(),
                     "staff": pd.DataFrame(), "teams": pd.DataFrame()}
 
-        self._upsert_dictionaries()
-        self._upsert_teams(data["teams"])
-        self._upsert_authors(data["staff"])
+        # Демо-словари (MAT-001..004 «Материал A1» и т.п.) — только под флагом.
+        # По дефолту материалы/режимы приходят провизорными кодами из LLM.
+        if settings.load_demo_dicts:
+            self._upsert_dictionaries()
+        else:
+            logger.info("Demo dictionaries skipped (load_demo_dicts=False)")
+        if settings.load_demo_teams:
+            self._upsert_teams(data["teams"])
+            self._upsert_authors(data["staff"])
+        else:
+            logger.info("Demo teams/staff skipped (load_demo_teams=False)")
 
-        for exp in struct_loader.iter_experiments(data["experiments"]):
-            try:
-                self._upsert_experiment(exp)
-                stats["experiments"] += 1
-            except Exception as e:
-                stats["errors"].append(f"experiment {exp.get('experiment_id')}: {e}")
+        # CSV-эксперименты — только если явно разрешено. По умолчанию
+        # источники истины — useful_info-сниппеты + LLM-экстракция из чанков.
+        if settings.load_csv_experiments:
+            for exp in struct_loader.iter_experiments(data["experiments"]):
+                try:
+                    self._upsert_experiment(exp)
+                    stats["experiments"] += 1
+                except Exception as e:
+                    stats["errors"].append(f"experiment {exp.get('experiment_id')}: {e}")
+        else:
+            logger.info("CSV experiments skipped (load_csv_experiments=False)")
 
         # --- Вложенные архивы: разворачиваем перед обходом документов ---
         if settings.unpack_archives:
@@ -64,7 +104,31 @@ class IngestService:
                 stats["errors"].append(f"unpack failed: {e}")
 
         # --- Документы (рекурсивный обход реального дерева) ---
-        for doc in doc_loader.iter_documents(corpus_dir):
+        # Параллельные воркеры парсят PDF/DOCX в подпроцессах, main-тред
+        # эмбеддит и пишет в БД по мере готовности. Overlap parse↔embed
+        # даёт основной выигрыш: раньше parse блокировал следующий embed.
+        # Уже загруженные документы пропускаются по file_path — так resume
+        # после краша ProcessPool не переваривает то же самое второй раз.
+        already = set()
+        try:
+            with get_neo4j().driver.session() as s:
+                recs = s.run(
+                    "MATCH (d:Document) WHERE d.file_path IS NOT NULL "
+                    "RETURN d.file_path AS p"
+                )
+                already = {r["p"] for r in recs if r["p"]}
+            if already:
+                logger.info(f"Resume mode: {len(already)} docs already ingested, will skip")
+        except Exception as e:
+            logger.warning(f"Cannot fetch existing docs: {e}")
+        workers = getattr(settings, "ingest_workers", 0) or 0
+        if workers >= 2:
+            doc_iter = doc_loader.iter_documents_parallel(
+                corpus_dir, max_workers=workers, skip_paths=already,
+            )
+        else:
+            doc_iter = doc_loader.iter_documents(corpus_dir)
+        for doc in doc_iter:
             try:
                 self._upsert_document(doc)
                 chunks = list(doc_loader.iter_chunks(doc))
@@ -74,8 +138,25 @@ class IngestService:
                 stats["documents"] += 1
                 dt = doc.get("doc_type") or "document"
                 stats["by_type"][dt] = stats["by_type"].get(dt, 0) + 1
+                if stats["documents"] % 10 == 0:
+                    logger.info(
+                        f"...обработано {stats['documents']} документов, "
+                        f"{stats['chunks']} чанков (дедуп {self._chunks_deduped})"
+                    )
             except Exception as e:
                 stats["errors"].append(f"document {doc.get('doc_id')}: {e}")
+
+        # --- Useful-info JSONL → Document + Author + черновые Experiment/Conclusion ---
+        # Отчёт делает tools/extract_useful_info.py (регексно-эвристический экстрактор),
+        # эта фаза только подтягивает уже собранные сниппеты в граф. LLM-обогащение
+        # материалов/режимов/свойств — отдельным шагом (/admin/useful_info/enrich).
+        if settings.useful_info_import_enabled:
+            try:
+                ui_stats = self._import_useful_info(corpus_dir)
+                stats["useful_info"] = ui_stats
+                stats["experiments"] += ui_stats.get("experiments", 0)
+            except Exception as e:  # noqa: BLE001
+                stats["errors"].append(f"useful_info import failed: {e}")
 
         # Веб-ресурсы
         for wdoc in web_loader.iter_web_resources(corpus_dir):
@@ -101,6 +182,38 @@ class IngestService:
             f"Ingest done: {stats['experiments']} exp, {stats['documents']} doc, "
             f"{stats['web_resources']} web, {stats['chunks']} chunks, "
             f"{stats['archives']} archives, {len(stats['errors'])} errors"
+        )
+        return stats
+
+    def _import_useful_info(self, corpus_dir):
+        report_path = settings.useful_info_report_path
+        stats = {"documents": 0, "authors": 0, "experiments": 0}
+        seen_docs = set()
+        seen_authors = set()
+
+        for record in useful_info_loader.iter_useful_info_records(report_path, corpus_dir):
+            doc = record["document"]
+            if doc["doc_id"] not in seen_docs:
+                self._upsert_document(doc)
+                seen_docs.add(doc["doc_id"])
+                stats["documents"] += 1
+
+            authors = record.get("authors") or []
+            if authors:
+                import pandas as pd
+                self._upsert_authors(pd.DataFrame(authors))
+                for author in authors:
+                    if author["author_id"] not in seen_authors:
+                        seen_authors.add(author["author_id"])
+                        stats["authors"] += 1
+
+            for exp in record.get("experiments") or []:
+                self._upsert_experiment(exp)
+                stats["experiments"] += 1
+
+        logger.info(
+            f"useful_info import: {stats['documents']} doc, {stats['authors']} authors, "
+            f"{stats['experiments']} draft experiments"
         )
         return stats
 
@@ -202,7 +315,12 @@ class IngestService:
             )
             for c, vec in zip(fresh, vecs)
         ]
-        get_qdrant().upsert(collection_name=settings.qdrant_collection_chunks, points=points)
+        # Батчинг: одна пачка чанков может весить >32 МБ JSON. Разбиваем по 500.
+        qc = get_qdrant()
+        batch = 500
+        for i in range(0, len(points), batch):
+            qc.upsert(collection_name=settings.qdrant_collection_chunks,
+                      points=points[i:i + batch])
 
     def _index_experiments_embeddings(self):
         from app.services.rag_service import RAGService
@@ -224,12 +342,17 @@ class IngestService:
         points = [
             PointStruct(
                 id=rag._stable_point_id(r["id"]), vector=vec,
-                payload={"experiment_id": r["id"], "title": r.get("title", "")},
+                payload={"experiment_id": r["id"], "title": (r.get("title") or "")[:200]},
             )
             for r, vec in zip(rows, vecs)
         ]
-        get_qdrant().upsert(collection_name=settings.qdrant_collection_experiments, points=points)
-        logger.info(f"Indexed {len(points)} experiments in Qdrant")
+        # Батчинг: 10k×384-dim JSON = ~60 МБ, Qdrant валит на 32 МБ. Заливаем по 500.
+        qc = get_qdrant()
+        batch = 500
+        for i in range(0, len(points), batch):
+            qc.upsert(collection_name=settings.qdrant_collection_experiments,
+                      points=points[i:i + batch])
+        logger.info(f"Indexed {len(points)} experiments in Qdrant (batches of {batch})")
 
     def _compute_similar_experiments(self, top_k=8):
         from app.services.rag_service import RAGService
@@ -253,11 +376,11 @@ class IngestService:
             if not pts:
                 continue
             vec = pts[0].vector
-            results = q.search(
+            results = q.query_points(
                 collection_name=settings.qdrant_collection_experiments,
-                query_vector=vec, limit=top_k + 1,
+                query=vec, limit=top_k + 1,
                 score_threshold=settings.similarity_threshold,
-            )
+            ).points
             with neo.driver.session() as s:
                 for r in results:
                     other_id = (r.payload or {}).get("experiment_id")
@@ -354,13 +477,19 @@ def _tx_upsert_author(tx, row):
 
 
 def _tx_upsert_experiment(tx, e):
+    src = e.get("source")
     tx.run("""
         MERGE (x:Experiment {experiment_id: $id})
         SET x.title = $title, x.description = $description,
-            x.year = $year, x.date = $date
+            x.year = $year, x.date = $date,
+            x.source = coalesce($source, x.source),
+            x.confidence = coalesce($confidence, x.confidence),
+            x.extracted = coalesce($extracted, x.extracted)
         """,
         id=e["experiment_id"], title=e.get("title"),
-        description=e.get("description"), year=e.get("year"), date=e.get("date"))
+        description=e.get("description"), year=e.get("year"), date=e.get("date"),
+        source=src, confidence=e.get("confidence"),
+        extracted=(True if src else None))
 
 
 def _tx_upsert_document(tx, doc, summary):

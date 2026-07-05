@@ -154,7 +154,7 @@ def graph_stats():
                 out["geo"][r["g"]] = r["c"]
             rec = s.run(
                 "MATCH (e:Experiment) RETURN count(e) AS exp, "
-                "size([(x:Experiment) WHERE x.extracted | x]) AS extracted"
+                "sum(CASE WHEN e.extracted THEN 1 ELSE 0 END) AS extracted"
             ).single()
             if rec:
                 out["totals"]["experiments"] = rec["exp"]
@@ -170,6 +170,121 @@ def graph_stats():
         out["totals"]["chunks"] = getattr(cnt, "count", None)
     except Exception:  # noqa: BLE001
         out["totals"]["chunks"] = None
+    return out
+
+
+def list_related(label, code, limit=20):
+    """Плоский список соседей узла: (тип, код, название, связь, вес).
+    Работает для любых Label — Material/Mode/Property/Experiment/Author/Team/Lab.
+    """
+    key = _key_field_for_label(label)
+    if not key:
+        return []
+    q = f"""
+    MATCH (a:{label} {{{key}: $code}})-[r]-(b)
+    WHERE b:Experiment OR b:Material OR b:Mode OR b:Property
+       OR b:Equipment OR b:Author OR b:Team OR b:Document OR b:Conclusion
+    WITH b, type(r) AS rel, coalesce(r.weight, 0.5) AS w
+    RETURN
+      head(labels(b)) AS type,
+      coalesce(b.code, b.experiment_id, b.author_id, b.team_id,
+               b.doc_id, b.conclusion_id) AS code,
+      coalesce(b.display_name, b.title, b.full_name, b.doc_id, '(без названия)') AS title,
+      rel AS relation,
+      w   AS weight
+    ORDER BY w DESC, title
+    LIMIT $lim
+    """
+    out = []
+    try:
+        with get_neo4j().driver.session() as s:
+            for r in s.run(q, code=code, lim=int(limit)):
+                out.append({
+                    "type": (r["type"] or "").lower(),
+                    "code": r["code"],
+                    "title": _truncate(r["title"], 80),
+                    "relation": r["relation"],
+                    "weight": float(r["weight"] or 0),
+                })
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"list_related({label}, {code}) failed: {e}")
+    return out
+
+
+def data_quality_summary():
+    """Осмысленные метрики для дашборда админки:
+    покрытие экстракции, доля обогащённых useful_info, распределение confidence,
+    доля EN/RU в описаниях экспериментов. Дороже, чем graph_stats, но не критично.
+    """
+    neo = get_neo4j()
+    out = {}
+    try:
+        with neo.driver.session() as s:
+            rec = s.run("""
+                MATCH (d:Document)
+                RETURN count(d) AS total,
+                       count(d.extracted_at) AS with_extract
+            """).single()
+            total_docs = int(rec["total"] or 0)
+            extracted_docs = int(rec["with_extract"] or 0)
+            out["extract_coverage"] = {
+                "documents_total": total_docs,
+                "documents_extracted": extracted_docs,
+                "pct": round(100.0 * extracted_docs / total_docs, 1) if total_docs else 0.0,
+            }
+
+            rec = s.run("""
+                MATCH (e:Experiment {source: 'useful_info'})
+                WITH count(e) AS total,
+                     sum(CASE WHEN (e)-[:USED_MATERIAL]->() OR
+                                   (e)-[:USED_MODE]->() OR
+                                   (e)-[:MEASURED]->() THEN 1 ELSE 0 END) AS enriched,
+                     avg(e.confidence) AS avg_conf
+                RETURN total, enriched, avg_conf
+            """).single()
+            ui_total = int(rec["total"] or 0)
+            ui_enriched = int(rec["enriched"] or 0)
+            out["useful_info"] = {
+                "drafts_total": ui_total,
+                "drafts_enriched": ui_enriched,
+                "pct": round(100.0 * ui_enriched / ui_total, 1) if ui_total else 0.0,
+                "avg_confidence": round(float(rec["avg_conf"] or 0), 2),
+            }
+
+            rec = s.run("""
+                MATCH (e:Experiment)
+                RETURN avg(e.confidence) AS avg_all,
+                       count(CASE WHEN e.confidence >= 0.75 THEN 1 END) AS high,
+                       count(CASE WHEN e.confidence >= 0.5 AND e.confidence < 0.75 THEN 1 END) AS mid,
+                       count(CASE WHEN e.confidence < 0.5 THEN 1 END) AS low
+            """).single()
+            out["confidence"] = {
+                "avg": round(float(rec["avg_all"] or 0), 2),
+                "high": int(rec["high"] or 0),
+                "mid": int(rec["mid"] or 0),
+                "low": int(rec["low"] or 0),
+            }
+
+            # Грубая эвристика EN/RU: доля кириллицы в description.
+            rec = s.run("""
+                MATCH (e:Experiment) WHERE e.description IS NOT NULL
+                WITH e, size([c IN split(e.description, '') WHERE c =~ '[а-яА-ЯёЁ]']) AS cyr,
+                     size(e.description) AS total
+                WITH count(e) AS n,
+                     sum(CASE WHEN total > 0 AND toFloat(cyr) / total > 0.3 THEN 1 ELSE 0 END) AS ru
+                RETURN n, ru
+            """).single()
+            n = int(rec["n"] or 0)
+            ru = int(rec["ru"] or 0)
+            out["language"] = {
+                "total": n,
+                "ru": ru,
+                "en_or_mixed": n - ru,
+                "ru_pct": round(100.0 * ru / n, 1) if n else 0.0,
+            }
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"data_quality_summary failed: {e}")
+        out["error"] = str(e)[:200]
     return out
 
 
@@ -282,6 +397,9 @@ def _pack_subgraph(tx, nodes_raw, anchor_keys):
             "unit": n.get("unit"),
             "category": n.get("category"),
             "family": n.get("family"),
+            "base_element": n.get("base_element"),
+            "gost": n.get("gost"),
+            "description": n.get("description"),
             "temperature_c": n.get("temperature_c"),
             "duration_h": n.get("duration_h"),
             "summary": n.get("summary"),

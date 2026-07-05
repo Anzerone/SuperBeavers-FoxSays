@@ -47,6 +47,10 @@ services:
     restart: unless-stopped
     ports:
       - "8010:8000"
+    # Без --reload: watchfiles на любой правке mounted-src запускает graceful
+    # shutdown и вешает фоновой enrich на 6115 экспериментов. Для демо и для
+    # длительного enrich нужен стабильный процесс.
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
     environment:
       NEO4J_URI: bolt://neo4j:7687
       NEO4J_USER: neo4j
@@ -55,17 +59,39 @@ services:
       OLLAMA_URL: http://host.docker.internal:11434
       OLLAMA_MODEL_SYNTH: qwen2.5:14b-instruct-q5_K_M
       OLLAMA_MODEL_TOOL: qwen2.5:3b-instruct-q5_K_M
+      # Разводим два прохода экстракции по разным моделям Ollama, чтобы
+      # они шли параллельно (Ollama держит независимые очереди на модель).
+      #   phase 2  → 3B (быстро прогнать длинные PDF)
+      #   enrich   → 14B (лучше выделяет материалы/режимы из коротких сниппетов)
+      OLLAMA_MODEL_EXTRACT: ${OLLAMA_MODEL_EXTRACT:-qwen2.5:3b-instruct-q5_K_M}
+      OLLAMA_MODEL_ENRICH:  ${OLLAMA_MODEL_ENRICH:-qwen2.5:14b-instruct-q5_K_M}
       PREMIUM_MODE: "false"
       EMBEDDINGS_ENABLED: "true"
-      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-intfloat/multilingual-e5-large}
+      # По умолчанию embeddings идут через Yandex Foundation Models (облако).
+      # EMBEDDING_PROVIDER=local вернёт fastembed-модель (офлайн-фолбэк).
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-yandex}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-intfloat/multilingual-e5-small}
+      YANDEX_EMBEDDING_MODEL_DOC: ${YANDEX_EMBEDDING_MODEL_DOC:-text-search-doc/latest}
+      YANDEX_EMBEDDING_MODEL_QUERY: ${YANDEX_EMBEDDING_MODEL_QUERY:-text-search-query/latest}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-384}
+      CHUNK_SIZE: ${CHUNK_SIZE:-1400}
+      CHUNK_OVERLAP: ${CHUNK_OVERLAP:-250}
       LLM_ENABLED: "true"
+      # Для демо-обогащения useful_info-сниппетов используем локальный Ollama:
+      # модель задаётся OLLAMA_MODEL_ENRICH, Yandex rate-limit не даст пройти корпус.
       LLM_PROVIDER: ${LLM_PROVIDER:-ollama}
       YANDEX_API_KEY: ${YANDEX_API_KEY:-}
       YANDEX_FOLDER_ID: ${YANDEX_FOLDER_ID:-}
       YANDEX_MODEL_SYNTH: ${YANDEX_MODEL_SYNTH:-yandexgpt/latest}
       YANDEX_MODEL_TOOL: ${YANDEX_MODEL_TOOL:-yandexgpt-lite/latest}
-      CORPUS_DIR: /data/corpus
+      # Целимся сразу в распакованный подкаталог с реальным датасетом хакатона
+      CORPUS_DIR: ${CORPUS_DIR:-/data/corpus/Задача 2. Научный клубок.zip.__unpacked__/Задача 2. Научный клубок}
+      USEFUL_INFO_REPORT_PATH: ${USEFUL_INFO_REPORT_PATH:-/outputs/useful_info/useful_info_by_file.jsonl}
       UNPACK_ARCHIVES: "true"
+      # При первом старте пустой БД — прогреваем корпус в фоне (weekend-friendly)
+      AUTO_INGEST_ON_STARTUP: ${AUTO_INGEST_ON_STARTUP:-true}
+      # Параллельные воркеры PDF-парсинга (0 = отключить)
+      INGEST_WORKERS: ${INGEST_WORKERS:-6}
       AUTO_ENRICHMENT_ENABLED: "true"
       AUTH_DB_PATH: /data/auth/auth.db
       JWT_SECRET: ${JWT_SECRET:-scientific-tangle-dev-secret-CHANGE-ME}
@@ -82,6 +108,10 @@ services:
       # ВАЖНО: НЕ read-only — ингест распаковывает вложенные архивы
       # (в т.ч. корпусный .zip) в папки *.__unpacked__ рядом с исходниками.
       - ./data/corpus:/data/corpus
+      # Отчёт useful_info (генерируется tools/extract_useful_info.py на хосте)
+      - ./outputs:/outputs
+      # Снимки для быстрого «первого запуска» — коммитятся через Git LFS
+      - ./data/snapshots:/data/snapshots
       - hf_cache:/root/.cache/huggingface
       - fastembed_cache:/root/.cache/fastembed
       - auth_data:/data/auth
@@ -93,7 +123,15 @@ services:
     ports:
       - "3000:3000"
     environment:
-      NEXT_PUBLIC_API_URL: http://localhost:8010
+      # Same-origin через Next rewrites: /api/* → backend:8000. Так фронт
+      # работает и через любой публичный туннель (pinggy/ngrok/cloudflared).
+      BACKEND_INTERNAL_URL: http://backend:8000
+    volumes:
+      # Hot-reload: правки JSX сразу видны без ребилда образа.
+      - ./frontend/src:/app/src
+      - ./frontend/public:/app/public:ro
+      - ./frontend/next.config.mjs:/app/next.config.mjs:ro
+      - ./frontend/tailwind.config.js:/app/tailwind.config.js:ro
     depends_on:
       - backend
 

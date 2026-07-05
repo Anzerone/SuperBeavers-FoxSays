@@ -1,0 +1,2 @@
+data/snapshots/*.gz filter=lfs diff=lfs merge=lfs -text
+data/snapshots/*.jsonl filter=lfs diff=lfs merge=lfs -text

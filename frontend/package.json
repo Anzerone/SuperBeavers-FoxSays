@@ -1,0 +1,28 @@
+{
+  "name": "scientific-tangle-frontend",
+  "version": "0.3.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "next": "15.0.3",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "cytoscape": "^3.30.2",
+    "cytoscape-fcose": "^2.2.0",
+    "chart.js": "^4.4.4",
+    "react-chartjs-2": "^5.2.0",
+    "lucide-react": "^0.460.0"
+  },
+  "devDependencies": {
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.4.49",
+    "tailwindcss": "^3.4.14",
+    "eslint": "^9.14.0",
+    "eslint-config-next": "15.0.3"
+  }
+}

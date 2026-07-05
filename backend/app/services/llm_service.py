@@ -49,6 +49,41 @@ def _parse_json_loose(raw: str):
     return None
 
 
+class _UserRequestGate:
+    """Простая уступка приоритета: enrichment вызывает `wait_until_free()` в
+    начале каждой итерации и, если в этот момент активен хотя бы один
+    интерактивный вызов LLM (/ask или /gaps/hypothesis), ждёт его завершения.
+
+    Одна модель qwen2.5:14b на GPU не тянет параллельные генерации, поэтому
+    без gate'а обогащение оттягивало гипотезу до нескольких минут.
+    """
+
+    def __init__(self):
+        import asyncio
+        self._active = 0
+        self._free = asyncio.Event()
+        self._free.set()
+
+    def enter(self):
+        self._active += 1
+        self._free.clear()
+
+    def exit(self):
+        self._active = max(0, self._active - 1)
+        if self._active == 0:
+            self._free.set()
+
+    async def wait_until_free(self):
+        # Небольшой запас: даём пользовательскому запросу несколько сот мс,
+        # чтобы не влезть между intent-парсингом и synth-генерацией.
+        import asyncio
+        await self._free.wait()
+        await asyncio.sleep(0.2)
+
+
+user_request_gate = _UserRequestGate()
+
+
 class LLMService:
     def __init__(self):
         self.client = httpx.AsyncClient(timeout=settings.llm_timeout_s)

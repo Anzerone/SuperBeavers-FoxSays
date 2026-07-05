@@ -1,0 +1,105 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html, body {
+    background: #F5F7FA;
+    color: #0B2545;
+    font-family: 'Inter', system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    margin: 0;
+    padding: 0;
+    min-height: 100vh;
+  }
+  * { box-sizing: border-box; }
+
+  h1, h2, h3, h4 {
+    font-family: 'Inter', system-ui, sans-serif;
+    letter-spacing: -0.01em;
+    color: #0B2545;
+  }
+
+  /* Скролл-бар в корпоративном стиле */
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-thumb { background: #C6CFD9; border-radius: 4px; }
+  ::-webkit-scrollbar-thumb:hover { background: #8896A5; }
+}
+
+@layer components {
+  .btn-primary {
+    @apply inline-flex items-center gap-2 rounded-md bg-brand-blue px-5 py-2.5 font-semibold
+           text-white shadow-sm transition-all hover:bg-brand-bluehover
+           disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .btn-accent {
+    @apply inline-flex items-center gap-2 rounded-md bg-brand-red px-5 py-2.5 font-semibold
+           text-white shadow-sm transition-all hover:bg-brand-redhover
+           disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .btn-secondary {
+    @apply inline-flex items-center gap-2 rounded-md border border-surface-divider bg-white
+           px-5 py-2.5 font-medium text-ink transition-all hover:bg-surface-hover;
+  }
+  .btn-ghost {
+    @apply inline-flex items-center gap-2 rounded-md px-3 py-1.5 text-sm font-medium
+           text-ink-muted transition-all hover:bg-surface-hover hover:text-ink;
+  }
+  .input {
+    @apply w-full rounded-md border border-surface-divider bg-white px-4 py-3
+           text-ink placeholder:text-ink-soft
+           focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/20
+           transition-colors;
+  }
+  .card {
+    @apply rounded-lg border border-surface-divider bg-white p-5 shadow-card
+           transition-shadow;
+  }
+  .card-hover {
+    @apply hover:shadow-cardHover hover:border-brand-blue/30 cursor-pointer;
+  }
+  .chip {
+    @apply inline-flex items-center gap-1 rounded-full bg-brand-navy/5 px-2.5 py-0.5
+           text-xs font-medium text-brand-navy;
+  }
+  .chip-accent {
+    @apply inline-flex items-center gap-1 rounded-full bg-brand-red/10 px-2.5 py-0.5
+           text-xs font-medium text-brand-red;
+  }
+  .badge-dot::before {
+    content: '';
+    display: inline-block;
+    width: 6px; height: 6px; border-radius: 50%;
+    background: currentColor;
+    margin-right: 6px;
+    vertical-align: middle;
+  }
+
+  /* Хедер */
+  .app-header {
+    @apply sticky top-0 z-40 bg-brand-navy shadow-header;
+  }
+  .app-nav-link {
+    @apply rounded-md px-3 py-1.5 text-sm font-medium text-white/80
+           transition-colors hover:text-white hover:bg-white/10;
+  }
+  .app-nav-link-active {
+    @apply text-white bg-white/20;
+  }
+}
+
+/* Полосатая корпоративная плашка (декор) */
+.stripe-accent {
+  background: rgba(255, 255, 255, 0.24);
+  height: 1px;
+}
+
+/* Fade-in анимация */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-fade { animation: fadeIn 0.3s cubic-bezier(0.4, 0, 0.2, 1); }

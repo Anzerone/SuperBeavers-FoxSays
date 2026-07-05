@@ -108,5 +108,25 @@ def _build_httpx(mod):
     mod.AsyncClient = AsyncClient
 
 
+def _build_loguru(mod):
+    """loguru тянет С-расширения; в тонком окружении заменяем no-op logger."""
+    class _Logger:
+        def __getattr__(self, _name):
+            return lambda *a, **k: None
+
+    mod.logger = _Logger()
+
+
+def _build_neo4j_client(mod):
+    """app.db.neo4j_client — модуль-обёртка, нужен только чтобы импорт eval_service
+    не падал на collect-фазе. Настоящие вызовы Neo4j в _prf/_load_pr_pairs не идут."""
+    def get_neo4j():
+        raise RuntimeError("stub neo4j_client: no real DB in tests")
+
+    mod.get_neo4j = get_neo4j
+
+
 _install_stub_module("neo4j", _build_neo4j)
 _install_stub_module("httpx", _build_httpx)
+_install_stub_module("loguru", _build_loguru)
+_install_stub_module("app.db.neo4j_client", _build_neo4j_client)

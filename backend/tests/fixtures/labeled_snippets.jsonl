@@ -1,0 +1,6 @@
+{"exp_id": "EXP-2024-001", "gold": {"material": "Материал A1", "mode": "отжиг", "property": "прочность", "value": "380 MPa"}, "source_snippet": "Отжиг образца A1 в печи П-1 при 900 °C, прочность 380 МПа"}
+{"exp_id": "EXP-2024-002", "gold": {"material": "Материал A1", "mode": "отжиг", "property": null, "value": "320 MPa"}, "source_snippet": "Отжиг A1 при 1100 °C, прочность падает до 320 МПа — рост зерна"}
+{"exp_id": "EXP-2024-003", "gold": {"material": "Материал A2", "mode": "отжиг", "property": "твёрдость", "value": "45 HRC"}, "source_snippet": "Твёрдость A2 после стандартного отжига 45 HRC"}
+{"exp_id": "EXP-2024-004", "gold": {"material": "Раствор Р1", "mode": "электролиз", "property": "выход по току", "value": "88 %"}, "source_snippet": "Замер выхода по току при 50 °C, электролиз Р1"}
+{"exp_id": "EXP-2024-005", "gold": {"material": "Раствор Р1", "mode": "электролиз", "property": "выход по току", "value": "72 %"}, "source_snippet": "Электролиз Р1 при 80 °C, выход по току 72%"}
+{"exp_id": "EXP-2023-010", "gold": {"material": "Материал A1", "mode": null, "property": "прочность", "value": "395 MPa"}, "source_snippet": "Архивный отжиг A1 при 900 °C, прочность 395 МПа"}
